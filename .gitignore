@@ -1,0 +1,37 @@
+# Python virtual environment
+venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Runtime data files
+metadata.json
+
+# Uploads directory for temporary files
+uploads/
+
+# IDE and OS-specific files
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+*.tmp
+*.temp 

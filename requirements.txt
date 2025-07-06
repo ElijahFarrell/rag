@@ -1,0 +1,47 @@
+# Core RAG dependencies
+llama-index-core
+llama-index
+llama-index-vector-stores-pinecone
+llama-index-embeddings-openai
+llama-index-llms-openai
+
+# Advanced document processing
+llama-parse
+llama-index-readers-llama-parse
+llama-index-readers-file
+
+# Hybrid search capabilities
+rank-bm25
+
+# FastAPI and web framework
+fastapi
+uvicorn
+python-multipart
+aiofiles
+
+# File processing and OCR
+pytesseract
+Pillow
+PyMuPDF
+python-magic
+
+# Background processing (optional for future)
+# celery[redis]
+# redis
+
+# Audio/Video processing (optional for future)
+# whisper
+# moviepy
+
+# Environment and utilities
+python-dotenv
+pydantic
+
+# Vector database
+pinecone-client
+
+# OpenAI
+openai
+
+# Additional utilities
+requests 

@@ -1,0 +1,13 @@
+The ultimate answer to life, the universe, and everything is 42.
+
+LlamaIndex is a powerful framework for building context-augmented AI applications. It provides tools for data ingestion, indexing, and querying using large language models.
+
+Key features of LlamaIndex include:
+- Data connectors to ingest data from various sources
+- Vector stores for efficient similarity search
+- Query engines for natural language interactions
+- Integration with popular LLMs like OpenAI GPT models
+
+RAG (Retrieval-Augmented Generation) combines the power of information retrieval with text generation. This allows AI systems to access specific knowledge bases and provide more accurate, contextual responses.
+
+Pinecone is a vector database that enables fast similarity search at scale. It's commonly used in RAG systems to store and retrieve document embeddings efficiently. 
