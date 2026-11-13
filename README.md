@@ -1,365 +1,214 @@
-# 🚀 Ultimate RAG System - Phase 4: Hybrid Search
+# LlamaIndex RAG service
 
-**The Most Advanced RAG System Available** - Combining enterprise-grade document processing with intelligent hybrid search capabilities.
+A two-entry retrieval-augmented generation (RAG) service built with LlamaIndex, FastAPI, Pinecone, and OpenAI. One process is a single shared index with document upload. The other creates a Pinecone index per knowledge base.
 
-## ✨ Key Features
+This repository is a portfolio snapshot of that service. It is not a hosted product, and it does not ship with credentials.
 
-### 🔍 **Hybrid Search Engine**
-- **Semantic Search**: OpenAI embeddings + Pinecone vector similarity
-- **BM25 Keyword Search**: Traditional term-based ranking with `rank-bm25`
-- **Intelligent Fusion**: 70% semantic + 30% keyword weighted scoring
-- **Query Expansion**: Automatic synonym expansion for better recall
-- **Fallback Handling**: Graceful degradation when components unavailable
+## What it does
 
-### 🔥 **ULTIMATE Document Processing**
-- **Always-On LlamaParse**: Maximum quality extraction for ALL supported documents
-- **Universal OCR**: Automatic text extraction from images, scanned content, and visual elements
-- **Advanced Table Extraction**: Complete preservation of table structure and data
-- **Comprehensive Content Analysis**: Extracts text from charts, diagrams, forms, and annotations
-- **Multi-format Support**: PDF, DOCX, XLSX, PPTX, Images (JPG/PNG/TIFF), Text, Markdown
-- **Structure-Aware Chunking**: Preserves document hierarchy and formatting
-- **Maximum Precision Mode**: Uses 'complex' strategy by default for enterprise-grade results
+You upload text or a supported file. The service extracts text, splits it into chunks, embeds the chunks, and stores them in Pinecone. A question is embedded the same way, matched against those chunks, and passed to an OpenAI chat model with the retrieved text.
 
-### 📊 **Production Analytics**
-- **Search Method Attribution**: Track semantic vs keyword vs hybrid matches
-- **Rich Metadata Extraction**: Complete processing pipeline information
-- **Performance Monitoring**: Response times, confidence scoring, system health
-- **Real-time Status Tracking**: Document processing progress and completion
+There are two FastAPI apps:
 
-### ⚡ **Production-Ready API**
-- **Background Processing**: Non-blocking document uploads with status tracking
-- **Comprehensive Endpoints**: Upload, query, analytics, health monitoring
-- **Advanced Error Handling**: Graceful failures with detailed logging
-- **Interactive Documentation**: Auto-generated OpenAPI docs
+| App | Module | Role |
+| --- | --- | --- |
+| Hybrid server | `hybrid_main.py` | One Pinecone index (`PINECONE_INDEX_NAME`). Upload, status, and query. |
+| Knowledge-base API | `main.py` | Creates a separate Pinecone index per knowledge base, then ingests and chats against it. |
 
-## 🏗️ Architecture
+Both apps use the retriever in `hybrid_search.py`.
+
+## Architecture
 
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   FastAPI       │    │   Pinecone      │    │   OpenAI API    │
-│   Hybrid Server │◄──►│   Vector Store  │◄──►│   (Embeddings)  │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                       │                       │
-         ▼                       ▼                       ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│ Hybrid Search   │    │  LlamaParse     │    │   BM25 Index    │
-│ (Semantic+BM25) │    │  Processor      │    │   (Keywords)    │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
+upload / ingest
+    -> extract text (LlamaParse, or a local fallback)
+    -> chunk
+    -> OpenAI (or Hugging Face) embeddings
+    -> Pinecone
+
+question
+    -> semantic search in Pinecone
+    -> BM25 over the in-memory chunk corpus
+    -> weighted merge
+    -> OpenAI completion using the top chunks
 ```
 
-## 🚀 Quick Start
+### Ingestion
 
-### 1. **Environment Setup**
+`hybrid_main.py` saves the file under `uploads/` and processes it in a FastAPI `BackgroundTasks` job (`LlamaParseHybridProcessor.process_document_pipeline`).
 
-Create a `.env` file with your API keys:
+When `LLAMA_CLOUD_API_KEY` is set, PDF, Office, text, markdown, and image files go through LlamaParse. The processor asks LlamaParse for markdown and, for images or names containing `scan`, uses the OCR parser. Other files, and every file when the LlamaParse key is missing, use a local fallback: LlamaIndex `SimpleDirectoryReader` for PDFs, a direct read for text and markdown, and a placeholder string for images. Image OCR is not performed in the fallback path.
 
-```env
-# Required - Core functionality
-OPENAI_API_KEY=sk-your-openai-api-key-here
-PINECONE_API_KEY=your-pinecone-api-key-here
-PINECONE_INDEX_NAME=your-index-name
+Chunks are stored as LlamaIndex `TextNode`s on the Pinecone index. If LlamaParse reports that formatting was preserved, chunks follow markdown-style sections and are capped around 1,500 characters. Otherwise the text is sliced every 1,000 characters.
 
-# Optional - Premium LlamaParse features
-LLAMA_CLOUD_API_KEY=llx-your-llamaparse-api-key-here
-```
+`main.py` is synchronous from the client's point of view. `KnowledgeBaseManager.ingest` runs LlamaParse when the key is set, otherwise it keeps the original text. Chunking splits on markdown headers, all-caps headings, or numbered sections, then packs sections toward 1,000 characters. The `overlap` argument on that helper is unused.
 
-**Where to get API keys:**
-- **OpenAI**: https://platform.openai.com/api-keys
-- **Pinecone**: https://app.pinecone.io/
-- **LlamaParse** (optional): https://cloud.llamaindex.ai/
+### Indexing
 
-### 2. **Install Dependencies**
+The hybrid server opens an existing Pinecone index named by `PINECONE_INDEX_NAME` when the process imports `llamaparse_hybrid_processor.py`.
+
+The knowledge-base API creates a new serverless Pinecone index for each knowledge base (`kb-{id}`, AWS, cosine). The region comes from `PINECONE_ENVIRONMENT`, default `us-east-1`. The dimension comes from the embedding model, or 1536 if the model object does not expose one. Index metadata is written to `metadata.json` in the working directory.
+
+Embeddings default to LlamaIndex `OpenAIEmbedding` (OpenAI's default model for that class, using `OPENAI_API_KEY`). The knowledge-base create call can pass another `embedding_model` name, which is loaded with `HuggingFaceEmbedding`.
+
+### Retrieval
+
+`HybridRetriever` runs two searches:
+
+- Semantic: embed the question and query Pinecone (`similarity_top_k` 8).
+- Keyword: an in-memory `BM25Okapi` index from `rank-bm25` (`bm25_top_k` 8).
+
+Scores are min-max normalized per list, then combined as `0.7 * semantic + 0.3 * bm25`. Results below `0.1` are dropped. A small fixed synonym list expands queries that mention financial, performance, increase, decrease, table, or report. This is not a general thesaurus.
+
+The BM25 corpus is the chunks processed in the current process. The hybrid server does not rebuild it from Pinecone after a restart. The knowledge-base API rebuilds BM25 from the nodes in the latest ingest call only.
+
+### LLM
+
+`HybridQueryEngine` takes the top five retrieved chunks, builds a prompt that includes scores and matched keywords, and calls `llm.complete`. On the hybrid server the LLM is the index LLM, or `OpenAI(model="gpt-3.5-turbo", temperature=0.1)` if the index has none. The knowledge-base API uses the same shape with `gpt-4o` as its fallback. If hybrid setup fails, the knowledge-base query path falls back to `index.as_query_engine(similarity_top_k=5, response_mode="compact")`.
+
+## Stack
+
+- Python, FastAPI, Uvicorn, Pydantic, python-dotenv
+- LlamaIndex (`llama-index`, Pinecone vector store, OpenAI embeddings and LLMs, LlamaParse reader)
+- Pinecone, OpenAI, optional LlamaCloud / LlamaParse
+- `rank-bm25` and NumPy for keyword search
+- `python-magic` for MIME detection on the hybrid path
+
+`requirements_advanced.txt` also lists Celery, Redis, Whisper, and MoviePy. The application code does not call them. Audio and video extensions appear only in the hybrid processor's time-estimate table. They are not transcribed.
+
+Install the dependencies the code imports:
 
 ```bash
-cd custom_rag_project
-source venv/bin/activate
-pip install -r requirements_advanced.txt
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### 3. **Start the Ultimate Server**
+`requirements.txt` does not pin versions.
+
+## How to run
+
+```bash
+cp .env.example .env
+# fill in .env locally; do not commit it
+```
+
+Hybrid server (binds `0.0.0.0:8000`):
 
 ```bash
 python hybrid_main.py
 ```
 
-🎉 **Server ready at:** http://localhost:8001
-
-- **Interactive API Docs**: http://localhost:8001/docs
-- **System Overview**: http://localhost:8001/
-- **Health Check**: http://localhost:8001/system/health
-
-## 📚 Usage Guide
-
-### **📤 Upload Documents**
-
-Upload any document type with automatic processing:
+Knowledge-base API (pick a different port if the hybrid server is already on 8000):
 
 ```bash
-# Upload a document
-curl -X POST "http://localhost:8001/upload" \
-     -F "file=@your-document.pdf"
-
-# Returns: upload_id for tracking
-{
-  "upload_id": "abc123...",
-  "filename": "your-document.pdf",
-  "status": "pending",
-  "estimated_processing_time_seconds": 45
-}
+uvicorn main:app --port 8002
 ```
 
-### **📊 Track Processing Status**
+FastAPI serves interactive docs at `/docs` on whichever port you started.
 
-Monitor document processing in real-time:
+The hybrid process connects to Pinecone at import. Both processes expect `OPENAI_API_KEY` and `PINECONE_API_KEY` to be present before you serve traffic. The knowledge-base API also needs permission to create and delete Pinecone indexes.
+
+### Hybrid server
 
 ```bash
-# Check processing status
-curl -X GET "http://localhost:8001/status/{upload_id}"
+curl -X POST "http://localhost:8000/upload" \
+  -H "Authorization: Bearer $RAG_API_KEY" \
+  -F "file=@data/test_hybrid_search.md"
 
-# Returns detailed processing information
-{
-  "status": "completed",
-  "progress_percentage": 100,
-  "processing_insights": {
-    "hybrid_search_ready": true,
-    "extraction_method": "LlamaParse-complex",
-    "processing_strategy": "complex",
-    "bm25_indexed": true
-  }
-}
+curl "http://localhost:8000/status/UPLOAD_ID" \
+  -H "Authorization: Bearer $RAG_API_KEY"
+
+curl -X POST "http://localhost:8000/query" \
+  -H "Authorization: Bearer $RAG_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What changed in revenue?"}'
 ```
 
-### **🔍 Hybrid Search Queries**
+`GET /` and `GET /system/health` are public. `GET /search/analytics` reports corpus counts for the current process and does not require a token. `GET /status/{upload_id}` can include an extracted-text preview, so it requires the token.
 
-Query with the most advanced search system:
+### Knowledge-base API
+
+Every `/knowledge_bases` route requires the same bearer token. `GET /` and `GET /health` are public.
 
 ```bash
-# Intelligent hybrid search
-curl -X POST "http://localhost:8001/query" \
-     -H "Content-Type: application/json" \
-     -d '{"question": "What was the revenue increase in Q4?"}'
+curl -X POST "http://localhost:8002/knowledge_bases" \
+  -H "Authorization: Bearer $RAG_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "demo"}'
 
-# Returns comprehensive results with analytics
-{
-  "query": "What was the revenue increase in Q4?",
-  "response": "Based on the search results, revenue increased by 25%...",
-  "search_analytics": {
-    "semantic_matches": 5,
-    "bm25_matches": 3,
-    "hybrid_matches": 2,
-    "top_matched_keywords": ["revenue", "q4", "increase"]
-  },
-  "sources": [...]
-}
+curl -X POST "http://localhost:8002/knowledge_bases/KB_ID/documents" \
+  -H "Authorization: Bearer $RAG_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"texts": ["LlamaIndex connects data to an LLM."]}'
+
+curl -X POST "http://localhost:8002/knowledge_bases/KB_ID/chat" \
+  -H "Authorization: Bearer $RAG_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What does LlamaIndex connect?"}'
 ```
 
-### **📈 System Analytics**
+Creating a knowledge base creates a real Pinecone index. Deleting a knowledge base deletes that index.
 
-Get comprehensive system insights:
+## Environment variables
+
+See `.env.example`. Names only:
+
+| Variable | Used for |
+| --- | --- |
+| `OPENAI_API_KEY` | Embeddings and chat completions |
+| `PINECONE_API_KEY` | Pinecone client |
+| `PINECONE_INDEX_NAME` | Existing index opened by the hybrid server |
+| `PINECONE_ENVIRONMENT` | Region for indexes created by the knowledge-base API. Default `us-east-1` |
+| `LLAMA_CLOUD_API_KEY` | Optional LlamaParse. Empty disables it |
+| `RAG_API_KEY` | Bearer token for protected routes. Unset means those routes return 503 |
+| `CORS_ALLOWED_ORIGINS` | Comma-separated browser origins for the hybrid server. `*` is ignored |
+| `MAX_UPLOAD_BYTES` | Upload cap. Default 20971520 (20 MiB) |
+
+## Security
+
+Protected routes check `Authorization: Bearer <RAG_API_KEY>` with a SHA-256 digest compared via `hmac.compare_digest`, so the check does not short-circuit on the first differing character or on the length of the configured key. If `RAG_API_KEY` is missing or blank, those routes return 503 and do not accept traffic.
+
+On the hybrid server, CORS origins are the `CORS_ALLOWED_ORIGINS` list. The wildcard origin is discarded. `allow_credentials` is false, so the server does not combine a wildcard with credentialed CORS.
+
+Uploads must use one of: `.pdf`, `.docx`, `.xlsx`, `.pptx`, `.txt`, `.md`, `.rtf`, `.html`, `.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`. The stored name is a sanitized basename plus the upload id. The original path is not used. Files over the size cap are rejected with 413 before they are written.
+
+`GET /`, health checks, and hybrid `GET /search/analytics` do not require a token. Analytics does not return document text. Do not put this process on the public internet without the API key set and without a private network or an additional gateway in front of it.
+
+## Sample data
+
+`data/wisdom.txt` and `data/test_hybrid_search.md` are synthetic documents for a manual upload. Nothing in the servers loads `data/` at startup. The markdown file is a fictional quarterly report used to exercise hybrid search (numbers plus surrounding prose). It is not a client document.
+
+## Layout
+
+```
+hybrid_main.py                    Hybrid FastAPI server
+llamaparse_hybrid_processor.py    Upload pipeline for that server
+main.py                           Knowledge-base FastAPI server
+kb_manager.py                     Per-knowledge-base indexes
+hybrid_search.py                  Semantic + BM25 retriever and query engine
+models.py                         Pydantic models for the hybrid server
+schemas.py                        Pydantic models for the knowledge-base API
+api_security.py                   Auth, CORS allowlist, upload limits
+tests/test_api_security.py        Unit tests for those checks
+```
+
+## Tests
+
+The security checks do not need Pinecone or OpenAI:
 
 ```bash
-# Search analytics
-curl -X GET "http://localhost:8001/search/analytics"
-
-# System health
-curl -X GET "http://localhost:8001/system/health"
+python -m unittest tests.test_api_security
+python -m compileall -q .
 ```
 
-## 🎯 Advanced Features
+The ingestion and query path is not covered by an automated test. Running it requires live OpenAI and Pinecone credentials.
 
-### **🔍 Search Methods**
+## Limitations
 
-The system intelligently combines multiple search approaches:
-
-1. **Semantic Search**: Understanding meaning and context
-   - Uses OpenAI embeddings for conceptual similarity
-   - Great for: "What are the main risks?" → finds risk-related content
-
-2. **BM25 Keyword Search**: Exact term and phrase matching
-   - Traditional ranking algorithm for literal matches
-   - Great for: "revenue Q4 2023" → finds exact financial data
-
-3. **Hybrid Ranking**: Best of both worlds
-   - Combines semantic understanding with keyword precision
-   - Smart weighting (70% semantic, 30% keywords)
-   - Query expansion with synonyms
-
-### **🔥 ULTIMATE Document Processing**
-
-**Always-On Maximum Quality Extraction** - Every document gets enterprise-grade processing:
-
-#### **🚀 Processing Strategies**
-- **Complex (Default)**: Maximum precision extraction with OCR for ALL documents
-  - Complete table structure preservation
-  - Advanced formatting recognition
-  - Embedded image text extraction
-  - Form field and annotation processing
-  - Mathematical formula extraction
-
-- **OCR (Images/Scans)**: Ultimate visual content extraction  
-  - Advanced OCR on all visual elements
-  - Handwritten text recognition
-  - Chart and diagram text extraction
-  - Multi-language OCR support
-  - Rotated/skewed text handling
-
-#### **📋 What Gets Extracted**
-✅ **All text content** with original formatting  
-✅ **Tables** with complete structure and data  
-✅ **Images** with OCR text extraction  
-✅ **Charts & Diagrams** with text recognition  
-✅ **Headers, footers, watermarks**  
-✅ **Form fields and annotations**  
-✅ **Mathematical formulas and equations**  
-✅ **Embedded images within documents**  
-✅ **Handwritten text** (where legible)  
-✅ **Multi-column layouts** preserved  
-
-#### **🎯 File Type Support**
-- **PDFs**: Complete extraction regardless of complexity
-- **Documents**: DOCX, XLSX, PPTX with full content analysis
-- **Images**: JPG, PNG, TIFF with advanced OCR
-- **Text Files**: Enhanced processing even for simple formats
-- **Scanned Documents**: Maximum OCR accuracy
-
-### **📊 Rich Metadata**
-
-Every search result includes comprehensive information:
-
-```json
-{
-  "content": "Extracted text...",
-  "score": 0.85,
-  "metadata": {
-    "filename": "financial-report.pdf",
-    "extraction_method": "LlamaParse-complex",
-    "table_extraction": true,
-    "ocr_performed": false,
-    "processing_strategy": "complex"
-  },
-  "search_info": {
-    "search_method": "hybrid",
-    "semantic_score": 0.82,
-    "bm25_score": 0.91,
-    "matched_keywords": ["revenue", "Q4"]
-  }
-}
-```
-
-## 🏗️ File Structure
-
-After cleanup, your optimal Phase 4 structure:
-
-```
-custom_rag_project/
-├── 🚀 hybrid_main.py                    # Main server - start here!
-├── 🔧 llamaparse_hybrid_processor.py    # Ultimate document processor
-├── 🔍 hybrid_search.py                  # Hybrid search engine
-├── 📊 models.py                         # API data models
-├── 📦 requirements_advanced.txt         # All dependencies
-├── 🧪 test_hybrid_search.md             # Comprehensive test document
-├── 📁 uploads/                          # Document upload storage
-├── 📁 venv/                            # Virtual environment
-├── 📄 .env                             # Environment configuration
-└── 📖 README.md                         # This guide
-```
-
-## 🎮 API Endpoints
-
-### **Core Operations**
-- `POST /upload` - Upload documents with automatic processing
-- `POST /query` - Hybrid search with analytics
-- `GET /status/{upload_id}` - Real-time processing status
-
-### **System Information**
-- `GET /` - System overview and capabilities
-- `GET /system/health` - Component health monitoring
-- `GET /search/analytics` - Search performance analytics
-
-### **Documentation**
-- `GET /docs` - Interactive API documentation
-- `GET /redoc` - Alternative API documentation
-
-## 🚀 Example Workflows
-
-### **1. Financial Document Analysis**
-
-```bash
-# 1. Upload a financial report
-curl -X POST "http://localhost:8001/upload" -F "file=@financial-report.pdf"
-
-# 2. Wait for processing (check status)
-curl -X GET "http://localhost:8001/status/{upload_id}"
-
-# 3. Query specific financial data
-curl -X POST "http://localhost:8001/query" \
-     -H "Content-Type: application/json" \
-     -d '{"question": "What was the profit margin in Q4?"}'
-```
-
-### **2. Technical Documentation Search**
-
-```bash
-# Upload technical manuals
-curl -X POST "http://localhost:8001/upload" -F "file=@api-documentation.pdf"
-
-# Search for specific features
-curl -X POST "http://localhost:8001/query" \
-     -H "Content-Type: application/json" \
-     -d '{"question": "How do I authenticate API requests?"}'
-```
-
-### **3. Multi-document Research**
-
-```bash
-# Upload multiple research papers
-for file in research-*.pdf; do
-  curl -X POST "http://localhost:8001/upload" -F "file=@$file"
-done
-
-# Cross-document analysis
-curl -X POST "http://localhost:8001/query" \
-     -H "Content-Type: application/json" \
-     -d '{"question": "What are the common themes across all studies?"}'
-```
-
-## 🔧 Troubleshooting
-
-### **Common Issues**
-
-1. **Missing API Keys**
-   ```
-   Components show as disabled in health check
-   ```
-   → Verify your `.env` file has all required API keys
-
-2. **BM25 Index Not Built**
-   ```
-   "bm25_index": false in health check
-   ```
-   → Upload some documents first; BM25 index builds automatically
-
-3. **LlamaParse Disabled**
-   ```
-   "llamaparse": false in health check
-   ```
-   → Add `LLAMA_CLOUD_API_KEY` to `.env` for premium features
-
-### **Performance Optimization**
-
-- **For speed**: Use simple processing strategy for basic documents
-- **For accuracy**: Enable LlamaParse for complex PDFs
-- **For scale**: Monitor system health and analytics endpoints
-
-## 🌟 Next Steps
-
-This Phase 4 system represents state-of-the-art RAG technology. Future enhancements could include:
-
-- **Phase 5**: Advanced OCR and multi-modal processing
-- **Phase 6**: Production monitoring and deployment features
-- **Custom Models**: Fine-tuned embeddings for domain-specific use cases
-- **Advanced Analytics**: Query performance optimization and user behavior tracking
-
----
-
-**🎉 Congratulations!** You now have the most advanced RAG system available, combining semantic understanding, keyword precision, enterprise document processing, and production-ready monitoring! 
+- Upload status and the BM25 corpus live in memory and are lost on restart.
+- Keyword search after a restart does not see chunks that exist only in Pinecone.
+- The knowledge-base BM25 index is rebuilt from the current ingest, not from the whole index.
+- LlamaParse quality features (OCR, tables, layout) run only when `LLAMA_CLOUD_API_KEY` is set and LlamaParse succeeds.
+- `requirements_advanced.txt` lists workers and media libraries the Python modules do not use.
+- Dependency versions are unpinned.

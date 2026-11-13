@@ -22,11 +22,17 @@ from typing import Dict, List, Optional, Any
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Query
+from fastapi import Depends, FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from api_security import (
+    cors_middleware_kwargs,
+    read_limited_upload,
+    require_api_key,
+    safe_upload_filename,
+)
 from models import *
 from llamaparse_hybrid_processor import llamaparse_hybrid_processor
 
@@ -101,20 +107,14 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Browser origins come from CORS_ALLOWED_ORIGINS. Wildcard and credentials are not used.
+app.add_middleware(CORSMiddleware, **cors_middleware_kwargs())
 
 # =====================================================================
 # ENHANCED API ENDPOINTS WITH HYBRID SEARCH
 # =====================================================================
 
-@app.post("/upload", response_model=UploadResponse)
+@app.post("/upload", response_model=UploadResponse, dependencies=[Depends(require_api_key)])
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -147,48 +147,47 @@ async def upload_document(
     """
     
     try:
-        # Generate unique upload ID
+        safe_name = safe_upload_filename(file.filename)
+        content = await read_limited_upload(file)
         upload_id = str(uuid.uuid4())
-        
-        # Validate file
-        if not file.filename:
-            raise HTTPException(status_code=400, detail="No filename provided")
-        
-        # Save uploaded file
-        file_path = f"uploads/{upload_id}_{file.filename}"
-        
+        file_path = f"uploads/{upload_id}_{safe_name}"
+        file_size = len(content)
+
         with open(file_path, "wb") as buffer:
-            content = await file.read()
             buffer.write(content)
-            file_size = len(content)
-        
-        logger.info(f"📁 File uploaded: {file.filename} ({file_size} bytes)")
-        
+
+        logger.info(f"📁 File uploaded: {safe_name} ({file_size} bytes)")
+
         # Create upload record with complexity analysis
         record = llamaparse_hybrid_processor.create_upload_record(
-            upload_id, file.filename, file_size
+            upload_id, safe_name, file_size
         )
-        
+
         # Start background processing
         background_tasks.add_task(
             llamaparse_hybrid_processor.process_document_pipeline,
-            upload_id, file_path, file.filename, document_type, custom_metadata
+            upload_id, file_path, safe_name, document_type, custom_metadata
         )
-        
-        # Enhanced response with capabilities
+
         return UploadResponse(
             upload_id=upload_id,
-            filename=file.filename,
+            filename=safe_name,
             status=DocumentStatus.PENDING,
             message="Document uploaded successfully and queued for ultimate processing",
             estimated_processing_time_seconds=record['metadata']['estimated_processing_time']
         )
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ Upload failed: {e}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
-@app.get("/status/{upload_id}", response_model=DocumentStatusResponse)
+@app.get(
+    "/status/{upload_id}",
+    response_model=DocumentStatusResponse,
+    dependencies=[Depends(require_api_key)],
+)
 async def get_document_status(upload_id: str):
     """
     📊 **ENHANCED STATUS TRACKING**
@@ -227,7 +226,11 @@ async def get_document_status(upload_id: str):
         }
     )
 
-@app.post("/query", response_model=HybridQueryResponse)
+@app.post(
+    "/query",
+    response_model=HybridQueryResponse,
+    dependencies=[Depends(require_api_key)],
+)
 async def hybrid_query(request: QueryRequest):
     """
     🔍 **ULTIMATE HYBRID QUERY SYSTEM**
@@ -364,6 +367,8 @@ async def hybrid_query(request: QueryRequest):
             }
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ Hybrid query failed: {e}")
         raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
@@ -581,12 +586,13 @@ async def root():
             }
         },
         "endpoints": {
-            "upload": "/upload - Upload and process documents",
-            "query": "/query - Hybrid search queries",
-            "status": "/status/{upload_id} - Processing status",
+            "upload": "/upload - Upload and process documents (bearer token required)",
+            "query": "/query - Hybrid search queries (bearer token required)",
+            "status": "/status/{upload_id} - Processing status (bearer token required)",
             "analytics": "/search/analytics - Search analytics",
             "health": "/system/health - System health check"
         },
+        "auth": "Authorization: Bearer <RAG_API_KEY> is required for /upload, /query, and /status/{upload_id}",
         "statistics": {
             "documents_indexed": len(set(node.metadata.get('upload_id', '') 
                                        for node in llamaparse_hybrid_processor.document_corpus)),

@@ -1,5 +1,6 @@
 # Python virtual environment
 venv/
+.venv/
 
 # Python cache files
 __pycache__/
@@ -20,9 +21,10 @@ uploads/
 .DS_Store
 Thumbs.db
 
-# Environment variables
+# Environment variables. .env.example is the only env file that belongs in git.
 .env
-.env.local
+.env.*
+!.env.example
 
 # Logs
 *.log
@@ -34,4 +36,4 @@ Thumbs.db
 
 # Temporary files
 *.tmp
-*.temp 
+*.temp
